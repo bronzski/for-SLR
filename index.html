@@ -134,7 +134,6 @@
         .green-dot { color: var(--success); font-weight: bold; }
         .red-dot { color: var(--danger); font-weight: bold; }
         .photo-thumb { display: inline-block; width: 80px; height: 80px; object-fit: cover; border-radius: 0.5rem; margin: 0.3rem; border: 1px solid #ddd; }
-        /* Кнопка сканирования этикеток – зафиксирована в левом верхнем углу */
         .sticky-btn {
             position: fixed;
             top: 10px;
@@ -167,18 +166,17 @@
 </div>
 
 <script>
-    // Состояние
     const state = {
         step: 'start',
         receiptNumber: null,
-        userId: 'Кладовщик_Иванов',
+        userId: 'Кладовщик',
         startTime: null,
         defectsPackaging: false,
         packagingPhotos: [],
         unloadStart: null,
         unloadEnd: null,
-        docImages: [],          // сырые файлы страниц документа
-        parsedDoc: null,        // { supplier, docNumber, docDate, items: [{id, name, article, qty, unit}] }
+        docImages: [],
+        parsedDoc: null,
         scannedItems: [],
         qualityResults: {},
         placementMap: {},
@@ -198,7 +196,6 @@
         document.getElementById('content').innerHTML = html;
     }
 
-    // ---------- Шаги ----------
     function startScreen() {
         state.receiptNumber = generateReceiptNumber();
         state.step = 'start';
@@ -282,7 +279,7 @@
                 <div id="docThumbs"></div>
             </div>
             <button class="btn btn-primary" id="ocrBtn" onclick="performOCR()">🔍 Завершить и распознать</button>
-            <div id="ocrStatus" style="text-align:center; color:#6c757d;"></div>
+            <div id="ocrStatus" style="text-align:center; color:#6c757d; margin-top: 10px;"></div>
         `);
     }
 
@@ -298,7 +295,6 @@
         });
     }
 
-    // ---- Предобработка изображения перед OCR ----
     function preprocessImage(file) {
         return new Promise((resolve, reject) => {
             const img = new Image();
@@ -308,7 +304,6 @@
                 canvas.width = img.width;
                 canvas.height = img.height;
                 ctx.drawImage(img, 0, 0);
-                // Повышаем контраст и переводим в ч/б
                 const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
                 const data = imageData.data;
                 for (let i = 0; i < data.length; i += 4) {
@@ -316,22 +311,18 @@
                     const g = data[i+1];
                     const b = data[i+2];
                     const gray = 0.299 * r + 0.587 * g + 0.114 * b;
-                    // Пороговая бинаризация
                     const threshold = 128;
                     const val = gray > threshold ? 255 : 0;
                     data[i] = data[i+1] = data[i+2] = val;
                 }
                 ctx.putImageData(imageData, 0, 0);
-                canvas.toBlob((blob) => {
-                    resolve(blob);
-                }, 'image/png');
+                canvas.toBlob((blob) => resolve(blob), 'image/png');
             };
             img.onerror = reject;
             img.src = URL.createObjectURL(file);
         });
     }
 
-    // ---- OCR + парсинг с жёсткой фильтрацией ----
     async function performOCR() {
         if (state.docImages.length === 0) {
             alert('Сделайте хотя бы одно фото.');
@@ -340,13 +331,12 @@
         const statusDiv = document.getElementById('ocrStatus');
         const btn = document.getElementById('ocrBtn');
         btn.disabled = true;
-        statusDiv.textContent = '⏳ Предобработка и распознавание...';
+        statusDiv.textContent = '⏳ Обработка изображения и распознавание...';
 
         let fullText = '';
         for (let i = 0; i < state.docImages.length; i++) {
             const file = state.docImages[i];
             try {
-                // Предобработка: улучшаем изображение
                 const processedBlob = await preprocessImage(file);
                 const imageUrl = URL.createObjectURL(processedBlob);
                 const { data: { text } } = await Tesseract.recognize(imageUrl, 'rus+eng', {
@@ -365,51 +355,50 @@
             }
         }
 
-        statusDiv.textContent = '✅ Текст распознан. Анализируем...';
+        statusDiv.textContent = '✅ Анализ табличной части...';
         const parsed = parseDocumentText(fullText);
+        
         if (parsed && parsed.items.length > 0) {
             state.parsedDoc = parsed;
             stepVerifyLabels();
         } else {
-            alert('Не удалось найти товарные позиции. Убедитесь в хорошем качестве фото и чётком шрифте. Попробуйте переснять документ при ярком свете.');
+            alert('Не удалось уверенно извлечь товары. Проверьте качество фото или добавьте данные вручную.');
             btn.disabled = false;
+            statusDiv.textContent = '⚠️ Товары не найдены';
         }
     }
 
     function parseDocumentText(text) {
-        const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-        // Извлечение шапки
-        const supplier = extractField(lines, [/Поставщик:?\s*(.+)/i, /ООО\s*".+?"/, /ИП\s+.+/]);
-        const docNumber = extractField(lines, [/(?:Счёт|УПД|Счет-фактура|Счет)\s*[№#]?\s*([\d\-]+)/i, /№\s*([\d\-]+)/]);
-        const docDate = extractField(lines, [/от\s*(\d{2}\.\d{2}\.\d{4}|\d{4}-\d{2}-\d{2})/]);
+        // Базовые данные документа
+        const linesRaw = text.split('\n').map(l => l.trim()).filter(l => l.length > 3);
+        const supplier = extractField(linesRaw, [/Поставщик:?\s*(.+)/i, /ООО\s*["«](.+?)["»]/, /ИП\s+([А-Яа-яA-Za-z\s]+)/]);
+        const docNumber = extractField(linesRaw, [/(?:Счёт|УПД|Счет-фактура|Счет)\s*[№#]?\s*([\d\-A-Za-z]+)/i, /№\s*([\d\-]+)/]);
+        const docDate = extractField(linesRaw, [/от\s*(\d{2}\.\d{2}\.\d{4}|\d{4}-\d{2}-\d{2})/]);
 
-        // Стоп-слова для исключения не-товарных строк
-        const stopWords = ['поставщик', 'покупатель', 'плательщик', 'грузополучатель', 'адрес', 'телефон', 'инн', 'кпп', 'р/с', 'банк', 'директор', 'менеджер', 'основание', 'всего', 'сумма', 'итого', 'ндс', 'подпись', 'расшифровка'];
-        // Дополнительные стоп-паттерны: длинные цифровые последовательности (>8 цифр) скорее всего телефон или счёт
-        const longNumberPattern = /\b\d{9,}\b/;
-
+        // Стоп-слова для полного игнора строк
+        const stopWords = ['поставщик', 'покупатель', 'плательщик', 'грузополучатель', 'адрес', 'телефон', 'инн', 'кпп', 'р/с', 'банк', 'директор', 'менеджер', 'основание', 'итого', 'в т.ч. ндс', 'подпись', 'расшифровка', 'сумма', 'цена', 'страница'];
+        
         const items = [];
-        const articleRegex = /([A-Za-z0-9\-]{5,})/;
-        const qtyRegex = /(\d+)\s*(шт|ед|компл|л|кг|м)/i;
+        
+        // Регулярка для количества (например: 5 шт, 10 компл, 2 кг)
+        const qtyRegex = /\b(\d+)\s*(шт|ед|компл|л|кг|м|упак)\b/i;
+        
+        // Регулярка для артикула: от 4 до 20 символов (буквы + цифры + дефисы).
+        // Добавлена кириллица. Исключает чисто символьные последовательности без букв/цифр.
+        const articlePattern = /\b([A-ZА-Яa-zа-я0-9\-]{4,20})\b/g;
 
-        for (let line of lines) {
-            const lower = line.toLowerCase();
+        for (let line of linesRaw) {
+            let lower = line.toLowerCase();
+            
+            // 1. Проверка на стоп-слова
             if (stopWords.some(kw => lower.includes(kw))) continue;
-            if (longNumberPattern.test(line)) continue; // пропускаем строки с длинными числами (телефоны, счета)
 
-            const articleMatch = line.match(articleRegex);
-            const qtyMatch = line.match(qtyRegex);
-            if (!articleMatch) continue; // без артикула — не товар
-
-            const article = articleMatch[1].toUpperCase();
-            // Исключаем артикулы, похожие на даты (содержат только цифры и точки)
-            if (/^\d{1,2}\.\d{1,2}\.\d{2,4}$/.test(article)) continue;
-            // Исключаем артикулы длиннее 25 символов (скорее всего не артикул)
-            if (article.length > 25) continue;
-
-            // Если уже есть такой артикул, дубликат
-            if (items.find(i => i.article === article)) continue;
-
+            // 2. Предварительная очистка от финансовых сумм (чтобы они не попали в артикулы)
+            // Удаляем паттерны типа "1 500,00", "150.00", "25 000"
+            let cleanLine = line.replace(/\b\d+[\s\.,]+\d{2}\b/g, ' ');
+            
+            // 3. Поиск количества
+            const qtyMatch = cleanLine.match(qtyRegex);
             let qty = 1;
             let unit = 'шт';
             if (qtyMatch) {
@@ -417,15 +406,43 @@
                 unit = qtyMatch[2] || 'шт';
             }
 
-            // Название товара: всё, что до артикула, или после (но не числа)
-            const parts = line.split(articleMatch[1]);
-            let name = parts[0].trim();
-            if (!name) name = parts[1] ? parts[1].trim() : 'Товар';
-            // Удаляем единицы измерения и числа из названия
-            name = name.replace(/\d+\s*(шт|ед|компл).*/i, '').replace(/\d+/g, '').trim();
-            if (!name) name = 'Товар';
-            // Корректировка типичных ошибок OCR в названии
+            // 4. Поиск артикула
+            let matches = [...cleanLine.matchAll(articlePattern)];
+            let article = null;
+            
+            for (let match of matches) {
+                let candidate = match[1];
+                
+                // Фильтрация ложных артикулов:
+                // Отсеиваем даты
+                if (/^\d{2}\.\d{2}\.\d{2,4}$/.test(candidate)) continue;
+                // Отсеиваем ИНН/КПП/Телефоны (чистые цифры длиной 9, 10, 11, 12)
+                if (/^\d+$/.test(candidate) && [9, 10, 11, 12].includes(candidate.length)) continue;
+                // Отсеиваем мелкие цифры (до 3 знаков), если это не явно указанный артикул
+                if (/^\d{1,3}$/.test(candidate) && !lower.includes('арт')) continue;
+
+                article = candidate.toUpperCase();
+                break; // Берем первый подходящий
+            }
+
+            if (!article) continue; // Без артикула строку игнорируем
+            if (items.find(i => i.article === article)) continue; // Исключаем дубликаты
+
+            // 5. Формирование чистого наименования
+            // Удаляем из строки найденный артикул и всё, что связано с количеством
+            let name = cleanLine
+                .replace(article, '')
+                .replace(qtyRegex, '')
+                .replace(/№/g, '') // убираем значки номера
+                .trim();
+                
+            // Убираем лишние спецсимволы по краям
+            name = name.replace(/^[-.,:;]+|[-.,:;]+$/g, '').trim();
+            
+            // Применяем исправления типичных опечаток OCR
             name = applyOCRFixes(name);
+            
+            if (!name || name.length < 3) name = 'Товар (наименование не распознано)';
 
             items.push({
                 id: items.length + 1,
@@ -448,62 +465,61 @@
         for (let line of lines) {
             for (let p of patterns) {
                 const m = line.match(p);
-                if (m) return m[1] || m[0];
+                if (m) return (m[1] || m[0]).trim();
             }
         }
         return null;
     }
 
-    // Исправление частых ошибок OCR в названиях
     function applyOCRFixes(name) {
         const fixes = {
             'Лверь': 'Дверь',
             'лверь': 'дверь',
             'Стёкло': 'Стекло',
             'с?текло': 'стекло',
-            '5': '5', // не меняем
-            '1': '1',
-            '7': '7',
+            'Колодки тормозныс': 'Колодки тормозные',
+            'Филтр': 'Фильтр',
+            'Диск торм': 'Диск тормозной'
         };
         let result = name;
-        // Простая замена известных искажений
         for (let [wrong, right] of Object.entries(fixes)) {
             result = result.replace(new RegExp(wrong, 'gi'), right);
         }
         return result;
     }
 
-    // ---- Сверка этикеток (кнопка зафиксирована в левом верхнем углу) ----
     function stepVerifyLabels() {
         state.step = 'verify_labels';
         state.scannedItems = [];
         const doc = state.parsedDoc;
         if (!doc) return startScreen();
 
-        // Удаляем старую кнопку, если была
         const oldBtn = document.getElementById('floatingScanBtn');
         if (oldBtn) oldBtn.remove();
 
         render(`
             <div class="step-indicator"><span>4/7</span> Сверка этикеток</div>
-            <div class="instruction">Сканируйте этикетки товаров</div>
-            <p style="text-align:center;">Ожидается: ${doc.items.length} | Подтверждено: <span id="scannedCount">0</span></p>
+            <div class="instruction">Отсканируйте товар по факту</div>
+            <div class="card" style="margin-bottom: 1rem; border-left: 4px solid var(--primary);">
+                <strong>Документ:</strong> ${doc.supplier}<br>
+                <small>№ ${doc.docNumber} от ${doc.docDate}</small>
+            </div>
+            <p style="text-align:center;">Ожидается: <strong>${doc.items.length}</strong> | Подтверждено: <strong id="scannedCount" style="color:var(--success)">0</strong></p>
             <div id="labelList" style="margin-bottom: 100px;">
                 ${doc.items.map(item => `
-                    <div id="item-${item.id}" class="list-item" style="border-left: 4px solid #dc3545;">
+                    <div id="item-${item.id}" class="list-item" style="border-left: 4px solid #dc3545; padding-left: 10px;">
                         <div><strong>${item.name}</strong><br><small>Арт: ${item.article} | ${item.qty} ${item.unit}</small></div>
                         <span id="status-${item.id}" class="red-dot">⏳</span>
                     </div>
                 `).join('')}
             </div>
-            <button class="btn btn-secondary" onclick="finishLabelCheck()">✅ Все этикетки отсканированы</button>
+            <button class="btn btn-secondary" onclick="finishLabelCheck()">✅ Завершить сверку (отправить в 1С)</button>
         `);
 
-        // Создаём плавающую кнопку
         const floatingBtn = document.createElement('button');
         floatingBtn.id = 'floatingScanBtn';
         floatingBtn.className = 'sticky-btn';
-        floatingBtn.innerHTML = '📸 Сканировать этикетку';
+        floatingBtn.innerHTML = '📸 Скан. этикетку';
         floatingBtn.onclick = scanLabel;
         document.body.appendChild(floatingBtn);
     }
@@ -512,25 +528,22 @@
         const btn = document.getElementById('floatingScanBtn');
         if (!btn) return;
         btn.disabled = true;
-        btn.textContent = '🔎 Жду фото...';
+        btn.textContent = '🔎 Обработка...';
 
         showCameraUpload('Сфотографируйте этикетку', async (files) => {
-            btn.textContent = '🔎 Распознаю...';
             const file = files[0];
             try {
                 const processedBlob = await preprocessImage(file);
                 const imageUrl = URL.createObjectURL(processedBlob);
-                const { data: { text } } = await Tesseract.recognize(imageUrl, 'rus+eng', {
-                    logger: m => {
-                        if (m.status === 'recognizing text') {
-                            btn.textContent = `🔎 ${Math.round(m.progress * 100)}%`;
-                        }
-                    }
-                });
-                const articleMatch = text.match(/([A-Za-z0-9\-]{5,})/);
+                const { data: { text } } = await Tesseract.recognize(imageUrl, 'rus+eng');
+                
+                // Ищем артикул на этикетке
+                const articleMatch = text.match(/\b([A-ZА-Яa-zа-я0-9\-]{4,20})\b/);
+                
                 if (articleMatch) {
                     const scannedArticle = articleMatch[1].toUpperCase();
-                    const foundItem = state.parsedDoc.items.find(item => item.article.toUpperCase() === scannedArticle);
+                    const foundItem = state.parsedDoc.items.find(item => item.article === scannedArticle);
+                    
                     if (foundItem) {
                         if (!state.scannedItems.includes(foundItem.id)) {
                             state.scannedItems.push(foundItem.id);
@@ -540,18 +553,18 @@
                             if (status) status.innerHTML = '<span class="green-dot">✓</span>';
                             document.getElementById('scannedCount').textContent = state.scannedItems.length;
                         }
-                        alert(`✓ "${foundItem.name}" подтверждена.`);
+                        alert(`✓ Подтверждено: "${foundItem.name}"`);
                     } else {
-                        alert(`⚠️ Артикул "${scannedArticle}" не найден в документе.`);
+                        alert(`⚠️ Артикул "${scannedArticle}" не числится в распознанном документе! Возможно, это пересорт или ошибка OCR.`);
                     }
                 } else {
-                    alert('Не удалось распознать артикул. Попробуйте ещё раз.');
+                    alert('Не удалось распознать артикул на этикетке. Попробуйте ближе и четче.');
                 }
             } catch (e) {
-                alert('Ошибка распознавания. Попробуйте ещё раз.');
+                alert('Ошибка распознавания камеры.');
             }
             btn.disabled = false;
-            btn.textContent = '📸 Сканировать этикетку';
+            btn.textContent = '📸 Скан. этикетку';
         });
     }
 
@@ -560,17 +573,15 @@
         const missing = doc.items.filter(item => !state.scannedItems.includes(item.id));
         if (missing.length > 0) {
             const list = missing.map(i => `❌ ${i.name} (арт. ${i.article})`).join('\n');
-            const userChoice = confirm(`⚠️ Недостача:\n${list}\n\n"OK" — подтвердить и продолжить, "Отмена" — вернуться к сканированию.`);
+            const userChoice = confirm(`⚠️ ВНИМАНИЕ! Не подтверждена недостача:\n${list}\n\n"OK" — оформить расхождение, "Отмена" — вернуться.`);
             if (!userChoice) return;
         }
-        // Убираем плавающую кнопку
         const btn = document.getElementById('floatingScanBtn');
         if (btn) btn.remove();
-        alert('📤 Отправка в 1С: поступление и приходный ордер сформированы.');
+        alert('📤 Данные готовы. Запрос к 1С для поиска заказа-наряда отправлен (эмуляция).');
         stepQualityControl();
     }
 
-    // Остальные шаги без изменений
     function stepQualityControl() {
         state.step = 'quality_control';
         const allItems = state.parsedDoc.items;
@@ -583,17 +594,17 @@
         render(`
             <div class="step-indicator"><span>5/7</span> Входной контроль</div>
             <div class="instruction">Осмотрите: <strong>${currentItem.name}</strong></div>
-            <p>Артикул: ${currentItem.article}</p>
-            <button class="btn btn-success" onclick="qualityResult(${currentItem.id}, false)">✅ Дефектов нет</button>
-            <button class="btn btn-danger" onclick="qualityResult(${currentItem.id}, true)">🔍 Обнаружен дефект</button>
+            <p style="text-align:center; color: var(--gray);">Артикул: ${currentItem.article}</p>
+            <button class="btn btn-success" style="margin-top:20px;" onclick="qualityResult(${currentItem.id}, false)">✅ Дефектов нет</button>
+            <button class="btn btn-danger" onclick="qualityResult(${currentItem.id}, true)">🔍 Фиксация брака</button>
         `);
     }
 
     function qualityResult(itemId, hasDefect) {
         if (hasDefect) {
-            showCameraUpload('Сфотографируйте дефекты', (files) => {
+            showCameraUpload('Сфотографируйте дефекты товара', (files) => {
                 state.qualityResults[itemId] = { defect: true, photos: files.map(f => URL.createObjectURL(f)) };
-                alert('Дефекты зафиксированы.');
+                alert('Брак зафиксирован. При размещении направить в изолятор.');
                 stepQualityControl();
             }, true);
         } else {
@@ -616,16 +627,15 @@
         render(`
             <div class="step-indicator"><span>6/7</span> Размещение</div>
             <div class="instruction">Разместите: <strong>${currentItem.name}</strong></div>
-            ${isDefect ? '<p style="color:red;">⚠️ В ИЗОЛЯТОР БРАКА!</p>' : ''}
-            <button class="btn btn-outline" onclick="scanLocation(${currentItem.id})">📸 Сканировать ячейку</button>
+            ${isDefect ? '<h3 style="color:var(--danger); text-align:center; margin-bottom: 10px;">⚠️ В ИЗОЛЯТОР БРАКА!</h3>' : ''}
+            <button class="btn btn-outline" style="margin-top:20px;" onclick="scanLocation(${currentItem.id})">📸 Сканировать ячейку (QR)</button>
         `);
     }
 
     function scanLocation(itemId) {
-        showCameraUpload('QR-код ячейки', (files) => {
-            const location = prompt('Введите адрес ячейки:', 'B-12-3');
-            state.placementMap[itemId] = { location: location || 'B-12-3' };
-            alert(`Размещено в ${location}. Ярлык распечатан.`);
+        showCameraUpload('Скан QR-кода ячейки', (files) => {
+            const location = prompt('Введите адрес ячейки (эмуляция скана):', 'A-01-15');
+            state.placementMap[itemId] = { location: location || 'A-01-15' };
             stepPlacement();
         });
     }
@@ -633,21 +643,23 @@
     function finishReceipt() {
         state.step = 'done';
         const totalTime = state.unloadEnd ? Math.round((state.unloadEnd - state.unloadStart)/1000) : 0;
+        const m = Math.floor(totalTime / 60);
+        const s = totalTime % 60;
+        
         render(`
             <div class="step-indicator"><span>7/7</span> Завершение</div>
             <div class="instruction">🎉 Приёмка №${state.receiptNumber} завершена!</div>
             <div class="card">
                 <p><strong>Поставщик:</strong> ${state.parsedDoc.supplier}</p>
-                <p><strong>Документ:</strong> ${state.parsedDoc.docNumber} от ${state.parsedDoc.docDate}</p>
-                <p><strong>Позиций:</strong> ${state.parsedDoc.items.length}</p>
-                <p><strong>Дефектных:</strong> ${Object.values(state.qualityResults).filter(v=>v.defect).length}</p>
-                <p><strong>Время выгрузки:</strong> ${totalTime} сек</p>
+                <p><strong>Документ:</strong> ${state.parsedDoc.docNumber}</p>
+                <p><strong>Принято позиций:</strong> ${state.parsedDoc.items.length}</p>
+                <p><strong>Изолятор брака:</strong> ${Object.values(state.qualityResults).filter(v=>v.defect).length} шт</p>
+                <p><strong>Время выгрузки:</strong> ${m} мин ${s} сек</p>
             </div>
-            <button class="btn btn-primary" onclick="startScreen()">🔄 Новая приёмка</button>
+            <button class="btn btn-primary" style="margin-top:20px;" onclick="startScreen()">🔄 Начать новую приёмку</button>
         `);
     }
 
-    // Универсальный захват фото
     function showCameraUpload(promptText, callback, multiple = false) {
         const input = document.createElement('input');
         input.type = 'file';
@@ -660,12 +672,13 @@
             }
         };
         const msg = document.createElement('div');
-        msg.style.cssText = 'position:fixed;top:0;left:0;width:100%;background:rgba(0,0,0,0.8);color:white;padding:2rem;text-align:center;z-index:9999;font-size:1.2rem;';
-        msg.textContent = promptText + ' (нажмите для выбора)';
+        msg.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100vh;background:rgba(0,0,0,0.85);color:white;display:flex;align-items:center;justify-content:center;z-index:9999;font-size:1.5rem;text-align:center;padding:2rem;cursor:pointer;';
+        msg.innerHTML = `<div>📷<br><br>${promptText}<br><br><small style="font-size:1rem;color:#ccc;">(Нажмите на экран)</small></div>`;
+        msg.onclick = () => input.click();
         document.body.appendChild(msg);
-        input.click();
-        input.addEventListener('change', () => document.body.removeChild(msg));
-        input.addEventListener('cancel', () => document.body.removeChild(msg));
+        
+        input.addEventListener('change', () => { if(document.body.contains(msg)) document.body.removeChild(msg); });
+        input.addEventListener('cancel', () => { if(document.body.contains(msg)) document.body.removeChild(msg); });
     }
 
     startScreen();
