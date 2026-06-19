@@ -3,8 +3,10 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>Склад 1.0 — Приёмка (Poka-Yoke Demo)</title>
+    <title>Склад SLR — Приёмка (Poka-Yoke Demo)</title>
     <link rel="manifest" href="data:application/manifest+json,%7B%22name%22%3A%22%D0%A1%D0%BA%D0%BB%D0%B0%D0%B4%22%2C%22short_name%22%3A%22%D0%A1%D0%BA%D0%BB%D0%B0%D0%B4%22%2C%22start_url%22%3A%22.%2F%22%2C%22display%22%3A%22standalone%22%2C%22background_color%22%3A%22%23f5f5f5%22%2C%22theme_color%22%3A%22%230d6efd%22%2C%22icons%22%3A%5B%7B%22src%22%3A%22data%3Aimage%2Fsvg%2Bxml%3Csvg%20xmlns%3D'http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg'%20viewBox%3D'0%200%20100%20100'%3E%3Crect%20width%3D'100'%20height%3D'100'%20fill%3D'%230d6efd'%2F%3E%3Ctext%20x%3D'50'%20y%3D'65'%20font-size%3D'50'%20text-anchor%3D'middle'%20fill%3D'white'%3E%D0%A1%3C%2Ftext%3E%3C%2Fsvg%3E%22%2C%22sizes%22%3A%22100x100%22%2C%22type%22%3A%22image%2Fsvg%2Bxml%22%7D%5D%7D">
+    <!-- Tesseract.js для распознавания текста -->
+    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
     <style>
         :root {
             --primary: #0d6efd;
@@ -105,11 +107,12 @@
             background: #f1f3f5;
             border-radius: 1rem;
             padding: 1rem;
+            margin-top: 0.5rem;
         }
         .upload-area {
             border: 2px dashed #adb5bd;
             border-radius: 1rem;
-            padding: 2rem;
+            padding: 1.5rem;
             text-align: center;
             cursor: pointer;
             background: #f8f9fa;
@@ -128,75 +131,58 @@
             border-bottom: 1px solid #dee2e6;
         }
         .text-muted { color: #6c757d; font-size: 0.9rem; }
-        .timer {
-            font-weight: bold;
-            font-size: 1.2rem;
-            margin: 0.5rem 0;
-        }
+        .timer { font-weight: bold; font-size: 1.2rem; margin: 0.5rem 0; }
+        .green-dot { color: var(--success); font-weight: bold; }
+        .red-dot { color: var(--danger); font-weight: bold; }
+        .photo-thumb { display: inline-block; width: 80px; height: 80px; object-fit: cover; border-radius: 0.5rem; margin: 0.3rem; border: 1px solid #ddd; }
         @media (max-width: 480px) {
             body { padding: 0; }
             .app-container { border-radius: 0; min-height: 100vh; }
             .btn { padding: 1rem; font-size: 1.1rem; }
         }
+        .ocr-indicator { display: flex; align-items: center; gap: 0.5rem; color: var(--gray); font-size: 0.9rem; }
     </style>
 </head>
 <body>
 <div class="app-container" id="app">
-    <div class="header">📦 Склад MiniSlide — Приёмка</div>
+    <div class="header">🏭 Склад SLR (ФДН 10) — Приёмка</div>
     <div class="content" id="content"></div>
 </div>
 
 <script>
-    // ----- Состояние приложения -----
+    // Состояние
     const state = {
-        step: 'start', // start, packaging, unload, scan_doc, verify_labels, quality_control, placement, done
+        step: 'start',
         receiptNumber: null,
         userId: 'Кладовщик_Иванов',
         startTime: null,
         defectsPackaging: false,
-        packagingPhotos: [],
+        packagingPhotos: [],       // URL созданных объектов
         unloadStart: null,
         unloadEnd: null,
-        docImages: [],       // фото страниц УПД
-        parsedDoc: null,     // результат "распознавания"
-        actualItems: [],     // список позиций, сверенных по этикеткам
-        qualityResults: {},  // id -> {defect: bool, photos: []}
-        placementMap: {},    // id -> {location: 'B-12'}
-        currentItemIdx: 0,
+        docImages: [],            // фото страниц документа
+        parsedDoc: null,          // { supplier, docNumber, docDate, items: [{id, name, article, qty, unit}] }
+        scannedItems: [],         // массив id позиций, которые уже подтверждены через этикетки
+        qualityResults: {},       // id -> {defect: bool, photos: []}
+        placementMap: {},         // id -> {location: 'B-12'}
     };
 
-    const DEMO_PARSED_DOC = {
-        supplier: 'ООО "Автодеталь"',
-        docNumber: 'УПД-24589',
-        docDate: '2026-06-18',
-        buyer: 'MiniSlide Центр',
-        items: [
-            { id: 1, name: 'Бампер передний BMW X5', article: 'BMW-5111-12345', qty: 2, unit: 'шт' },
-            { id: 2, name: 'Фара левая Audi A6', article: 'AU-941-67890', qty: 1, unit: 'шт' },
-            { id: 3, name: 'Зеркало правое Skoda Octavia', article: 'SK-5E1-857', qty: 2, unit: 'шт' },
-            { id: 4, name: 'Стекло лобовое Kia Sportage', article: 'KI-86110-F1000', qty: 1, unit: 'шт' },
-            { id: 5, name: 'Решётка радиатора VW Tiguan', article: 'VW-5NA-853-651', qty: 1, unit: 'шт' },
-        ]
-    };
+    // Счетчик поставок для генерации номера
+    let receiptCounter = 1;
 
-    // Утилиты
     function generateReceiptNumber() {
         const now = new Date();
         const month = String(now.getMonth() + 1).padStart(2, '0');
         const year = now.getFullYear();
-        const count = Math.floor(Math.random() * 100) + 1; // имитация счётчика
-        return `П-${month}${year}-${String(count).padStart(3, '0')}`;
+        const num = String(receiptCounter++).padStart(3, '0');
+        return `П-${month}${year}-${num}`;
     }
 
     function render(html) {
         document.getElementById('content').innerHTML = html;
     }
 
-    function saveStateAndRender(renderFn) {
-        renderFn();
-    }
-
-    // ----- Шаги -----
+    // ---------- Шаги ----------
     function startScreen() {
         state.receiptNumber = generateReceiptNumber();
         state.step = 'start';
@@ -211,6 +197,7 @@
 
     function stepPackaging() {
         state.step = 'packaging';
+        state.packagingPhotos = [];
         render(`
             <div class="step-indicator"><span>1/7</span> Осмотр упаковок до выгрузки</div>
             <div class="instruction">Осмотри прибывший груз в машине.</div>
@@ -224,11 +211,18 @@
 
     function packagingDefectYes() {
         state.defectsPackaging = true;
-        // Имитация фотографирования дефектов
         showCameraUpload('Сфотографируйте дефекты упаковки', (files) => {
             state.packagingPhotos = files.map(f => URL.createObjectURL(f));
-            alert('Дефекты зафиксированы. Продолжайте.');
-            stepUnload();
+            // Показать фото на этом же шаге
+            render(`
+                <div class="step-indicator"><span>1/7</span> Осмотр упаковок</div>
+                <div class="instruction">Дефекты зафиксированы</div>
+                <div id="packPhotos" style="margin:1rem 0;">
+                    ${state.packagingPhotos.map(url => `<img src="${url}" class="photo-thumb" onclick="window.open('${url}')">`).join('')}
+                </div>
+                <p>Продолжите приёмку.</p>
+                <button class="btn btn-primary" onclick="stepUnload()">▶️ Продолжить</button>
+            `);
         }, true);
     }
 
@@ -247,7 +241,6 @@
             <div class="timer" id="unloadTimer">00:00:00</div>
             <button class="btn btn-primary" onclick="finishUnload()">🏁 Завершить выгрузку</button>
         `);
-        // Запуск секундомера
         window.unloadInterval = setInterval(() => {
             const diff = Math.floor((new Date() - state.unloadStart) / 1000);
             const h = String(Math.floor(diff/3600)).padStart(2,'0');
@@ -266,20 +259,22 @@
 
     function stepScanDocument() {
         state.step = 'scan_doc';
+        state.docImages = [];
+        state.parsedDoc = null;
         render(`
-            <div class="step-indicator"><span>3/7</span> Сканирование УПД</div>
-            <div class="instruction">Сфотографируйте все страницы документа поставки.</div>
+            <div class="step-indicator"><span>3/7</span> Сканирование документа</div>
+            <div class="instruction">Сфотографируйте все страницы документа поставки (счёт / УПД).</div>
             <div id="docPreview" class="upload-area" onclick="triggerDocPhoto()">
                 📄 Нажмите, чтобы добавить страницу
                 <div id="docThumbs"></div>
             </div>
-            <button class="btn btn-primary" onclick="simulateOCR()">🔍 Завершить сканирование и распознать</button>
+            <button class="btn btn-primary" id="ocrBtn" onclick="performOCR()">🔍 Завершить сканирование и распознать</button>
+            <div id="ocrStatus" class="ocr-indicator"></div>
         `);
-        state.docImages = [];
     }
 
     function triggerDocPhoto() {
-        showCameraUpload('Фото страницы УПД', (files) => {
+        showCameraUpload('Фото страницы документа', (files) => {
             const file = files[0];
             state.docImages.push(file);
             const thumb = document.getElementById('docThumbs');
@@ -290,66 +285,188 @@
         });
     }
 
-    function simulateOCR() {
+    // ---- OCR документа ----
+    async function performOCR() {
         if (state.docImages.length === 0) {
             alert('Сделайте хотя бы одно фото документа.');
             return;
         }
-        // Имитация работы нейросети
-        state.parsedDoc = JSON.parse(JSON.stringify(DEMO_PARSED_DOC));
-        state.actualItems = []; // сбрасываем
-        stepVerifyLabels();
+        const statusDiv = document.getElementById('ocrStatus');
+        const btn = document.getElementById('ocrBtn');
+        btn.disabled = true;
+        statusDiv.innerHTML = '⏳ Идёт распознавание... (может занять до минуты)';
+
+        let fullText = '';
+        for (let i = 0; i < state.docImages.length; i++) {
+            const file = state.docImages[i];
+            const imageUrl = URL.createObjectURL(file);
+            try {
+                const { data: { text } } = await Tesseract.recognize(imageUrl, 'rus+eng', {
+                    logger: m => {
+                        if (m.status === 'recognizing text') {
+                            statusDiv.innerHTML = `🔎 Распознавание страницы ${i+1}: ${Math.round(m.progress * 100)}%`;
+                        }
+                    }
+                });
+                fullText += text + '\n';
+            } catch (e) {
+                console.error(e);
+                alert('Ошибка распознавания. Попробуйте ещё раз.');
+                btn.disabled = false;
+                return;
+            }
+        }
+
+        statusDiv.innerHTML = '✅ Распознавание завершено. Извлекаем данные...';
+        // Парсим текст: ищем табличную часть.
+        const parsed = parseDocumentText(fullText);
+        if (parsed && parsed.items.length > 0) {
+            state.parsedDoc = parsed;
+            stepVerifyLabels();
+        } else {
+            alert('Не удалось извлечь табличную часть. Проверьте качество фото. Попробуйте снова.');
+            btn.disabled = false;
+        }
     }
 
+    function parseDocumentText(text) {
+        // Очень упрощённый парсер для демонстрации.
+        // Ищем строки с артикулами (например, "BMW-5111-12345" или "1234567")
+        const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+        const items = [];
+        // Шаблон артикула: содержит цифры и возможно дефисы, длиной от 5 символов
+        const articleRegex = /([A-Za-z0-9\-]{5,})/;
+        // Пытаемся также найти числа (количество) в конце строки
+        const qtyRegex = /(\d+)\s*(шт|ед|компл)/i;
+
+        // Ищем строки, похожие на позиции: есть артикул и возможно количество
+        lines.forEach(line => {
+            const articleMatch = line.match(articleRegex);
+            if (articleMatch) {
+                const article = articleMatch[1];
+                // Пытаемся найти количество
+                const qtyMatch = line.match(qtyRegex);
+                const qty = qtyMatch ? parseInt(qtyMatch[1]) : 1;
+                // Всё, что до артикула — наименование (сильно упрощённо)
+                const namePart = line.substring(0, line.indexOf(article)).trim();
+                const name = namePart || 'Товар';
+                // Убираем дубликаты по артикулу
+                if (!items.find(i => i.article === article)) {
+                    items.push({
+                        id: items.length + 1,
+                        name: name,
+                        article: article,
+                        qty: qty,
+                        unit: qtyMatch ? qtyMatch[2] : 'шт'
+                    });
+                }
+            }
+        });
+
+        // Если ничего не нашли, возвращаем null
+        if (items.length === 0) return null;
+
+        // Попытка найти поставщика, номер документа, дату (очень условно)
+        const supplierMatch = text.match(/Поставщик:?\s*(.+)/i) || text.match(/ООО\s*".+?"/);
+        const docNumberMatch = text.match(/№\s*([\d\-]+)/);
+        const docDateMatch = text.match(/от\s*(\d{2}\.\d{2}\.\d{4})/);
+
+        return {
+            supplier: supplierMatch ? supplierMatch[1] || supplierMatch[0] : 'Неизвестный поставщик',
+            docNumber: docNumberMatch ? docNumberMatch[1] : 'б/н',
+            docDate: docDateMatch ? docDateMatch[1] : new Date().toLocaleDateString(),
+            items: items
+        };
+    }
+
+    // ---- Сверка этикеток (новая логика) ----
     function stepVerifyLabels() {
         state.step = 'verify_labels';
+        state.scannedItems = [];
         const doc = state.parsedDoc;
         if (!doc) return startScreen();
-        const remaining = doc.items.filter(it => !state.actualItems.find(a => a.id === it.id));
-        if (remaining.length === 0) {
-            // Все позиции подтверждены
-            if (state.actualItems.length < doc.items.length) {
-                alert(`⚠️ Недостача: отсутствуют позиции: ${doc.items.filter(i=>!state.actualItems.find(a=>a.id===i.id)).map(i=>i.name).join(', ')}`);
-            }
-            stepQualityControl();
-            return;
-        }
+
         render(`
             <div class="step-indicator"><span>4/7</span> Сверка этикеток</div>
-            <div class="instruction">Сфотографируйте этикетку каждой позиции.</div>
-            <p>Ожидается позиций: ${doc.items.length}. Подтверждено: ${state.actualItems.length}.</p>
-            <div id="labelList"></div>
-            <button class="btn btn-outline" onclick="skipRemaining()">⚠️ Проверка завершена (недостача)</button>
-        `);
-        displayLabelVerification(remaining);
-    }
-
-    function displayLabelVerification(remaining) {
-        const container = document.getElementById('labelList');
-        container.innerHTML = remaining.map(item => `
-            <div class="list-item">
-                <div><strong>${item.name}</strong><br><small>Арт: ${item.article} | ${item.qty} ${item.unit}</small></div>
-                <button class="btn btn-sm btn-outline" onclick="scanLabel(${item.id})">📸 Сканировать этикетку</button>
+            <div class="instruction">Сканируйте этикетки всех позиций из поставки.<br>Программа сама определит, что к чему относится.</div>
+            <p>Ожидается позиций: ${doc.items.length}. Отсканировано: <span id="scannedCount">0</span></p>
+            <div id="labelList">
+                ${doc.items.map(item => `
+                    <div id="item-${item.id}" class="list-item" style="background:#fff; border-left: 4px solid #dc3545;">
+                        <div><strong>${item.name}</strong><br><small>Арт: ${item.article} | ${item.qty} ${item.unit}</small></div>
+                        <span class="red-dot" id="status-${item.id}">⏳</span>
+                    </div>
+                `).join('')}
             </div>
-        `).join('');
+            <button class="btn btn-outline" id="scanLabelBtn" onclick="scanLabel()">📸 Сканировать этикетку</button>
+            <button class="btn btn-secondary" onclick="finishLabelCheck()">✅ Все этикетки отсканированы</button>
+        `);
     }
 
-    function scanLabel(itemId) {
-        showCameraUpload(`Сканируйте этикетку позиции ID=${itemId}`, (files) => {
-            // Имитация успешного распознавания
-            const item = state.parsedDoc.items.find(i => i.id === itemId);
-            if (item && !state.actualItems.find(a => a.id === itemId)) {
-                state.actualItems.push({...item});
+    async function scanLabel() {
+        showCameraUpload('Сфотографируйте этикетку товара', async (files) => {
+            const file = files[0];
+            const imageUrl = URL.createObjectURL(file);
+            // Запускаем распознавание этикетки
+            const statusElem = document.getElementById('scanLabelBtn');
+            statusElem.disabled = true;
+            statusElem.textContent = '🔎 Распознаю...';
+            try {
+                const { data: { text } } = await Tesseract.recognize(imageUrl, 'rus+eng', {
+                    logger: m => {
+                        if (m.status === 'recognizing text') {
+                            statusElem.textContent = `🔎 ${Math.round(m.progress * 100)}%`;
+                        }
+                    }
+                });
+                // Ищем артикул в тексте этикетки
+                const articleMatch = text.match(/([A-Za-z0-9\-]{5,})/);
+                if (articleMatch) {
+                    const scannedArticle = articleMatch[1].toUpperCase();
+                    // Ищем совпадение с позициями документа
+                    const foundItem = state.parsedDoc.items.find(item => item.article.toUpperCase() === scannedArticle);
+                    if (foundItem) {
+                        if (!state.scannedItems.includes(foundItem.id)) {
+                            state.scannedItems.push(foundItem.id);
+                            // Обновляем интерфейс
+                            const row = document.getElementById(`item-${foundItem.id}`);
+                            if (row) {
+                                row.style.borderLeft = '4px solid #198754';
+                                const status = document.getElementById(`status-${foundItem.id}`);
+                                if (status) status.innerHTML = '<span class="green-dot">✓</span>';
+                            }
+                            document.getElementById('scannedCount').textContent = state.scannedItems.length;
+                        }
+                        alert(`✓ Позиция "${foundItem.name}" подтверждена.`);
+                    } else {
+                        alert(`⚠️ Артикул "${scannedArticle}" не найден в документе. Проверьте этикетку.`);
+                    }
+                } else {
+                    alert('Не удалось распознать артикул на этикетке. Попробуйте ещё раз.');
+                }
+            } catch (e) {
+                alert('Ошибка распознавания. Попробуйте ещё раз.');
             }
-            stepVerifyLabels();
+            statusElem.disabled = false;
+            statusElem.textContent = '📸 Сканировать этикетку';
         });
     }
 
-    function skipRemaining() {
-        // Пользователь говорит, что проверил всё – оставшиеся считаются недостачей
+    function finishLabelCheck() {
+        const doc = state.parsedDoc;
+        const missing = doc.items.filter(item => !state.scannedItems.includes(item.id));
+        if (missing.length > 0) {
+            const list = missing.map(i => `❌ ${i.name} (арт. ${i.article})`).join('\n');
+            const userChoice = confirm(`⚠️ Не все позиции отсканированы. Недостача:\n${list}\n\nНажмите "OK", чтобы подтвердить недостачу и продолжить, или "Отмена", чтобы вернуться и продолжить сканирование.`);
+            if (!userChoice) return;
+        }
+        // Все позиции либо подтверждены, либо пользователь согласился с недостачей
+        alert('📤 Отправка данных в 1С: формируется приходный ордер и поступление.');
+        // Переход к входному контролю
         stepQualityControl();
     }
 
+    // ---- Входной контроль ----
     function stepQualityControl() {
         state.step = 'quality_control';
         const allItems = state.parsedDoc.items;
@@ -359,10 +476,9 @@
             return;
         }
         const currentItem = unchecked[0];
-        state.currentItemIdx = allItems.indexOf(currentItem);
         render(`
             <div class="step-indicator"><span>5/7</span> Входной контроль</div>
-            <div class="instruction">Осмотрите позицию: <strong>${currentItem.name}</strong></div>
+            <div class="instruction">Осмотрите позицию:<br><strong>${currentItem.name}</strong></div>
             <p>Артикул: ${currentItem.article}</p>
             <button class="btn btn-success" onclick="qualityResult(${currentItem.id}, false)">✅ Дефектов нет</button>
             <button class="btn btn-danger" onclick="qualityResult(${currentItem.id}, true)">🔍 Обнаружен дефект</button>
@@ -385,6 +501,7 @@
         }
     }
 
+    // ---- Размещение ----
     function stepPlacement() {
         state.step = 'placement';
         const allItems = state.parsedDoc.items;
@@ -400,7 +517,7 @@
             <div class="step-indicator"><span>6/7</span> Размещение на хранение</div>
             <div class="instruction">Разместите: <strong>${currentItem.name}</strong></div>
             ${isDefect ? '<p style="color:red;">⚠️ Деталь с дефектом — поместите в ИЗОЛЯТОР БРАКА!</p>' : ''}
-            <p>Сфотографируйте QR-код ячейки размещения.</p>
+            <p>Отсканируйте QR-код ячейки размещения.</p>
             <button class="btn btn-outline" onclick="scanLocation(${currentItem.id})">📸 Сканировать ячейку</button>
         `);
     }
@@ -414,9 +531,25 @@
         });
     }
 
+    // ---- Завершение ----
     function finishReceipt() {
         state.step = 'done';
         const totalTime = state.unloadEnd ? Math.round((state.unloadEnd - state.unloadStart)/1000) : 0;
+        // Собираем фото дефектов упаковки и деталей
+        let packagingPhotosHtml = '';
+        if (state.packagingPhotos.length > 0) {
+            packagingPhotosHtml = `<p><strong>Фото дефектов упаковки:</strong></p>` +
+                state.packagingPhotos.map(url => `<img src="${url}" class="photo-thumb" onclick="window.open('${url}')">`).join('');
+        }
+        let defectItemsHtml = '';
+        for (let [id, res] of Object.entries(state.qualityResults)) {
+            if (res.defect && res.photos.length > 0) {
+                const item = state.parsedDoc.items.find(i => i.id == id);
+                defectItemsHtml += `<p><strong>Дефект: ${item ? item.name : '?'}</strong></p>` +
+                    res.photos.map(url => `<img src="${url}" class="photo-thumb" onclick="window.open('${url}')">`).join('');
+            }
+        }
+
         render(`
             <div class="step-indicator"><span>7/7</span> Завершение</div>
             <div class="instruction">🎉 Приёмка №${state.receiptNumber} завершена!</div>
@@ -427,26 +560,25 @@
                 <p><strong>Дефектных:</strong> ${Object.values(state.qualityResults).filter(v=>v.defect).length}</p>
                 <p><strong>Время выгрузки:</strong> ${totalTime} сек</p>
             </div>
+            ${packagingPhotosHtml}
+            ${defectItemsHtml}
             <p class="text-muted" style="text-align:center;">✅ Автоматически сформированы: поступление и приходный ордер в 1С.<br>Уведомления о дефектах отправлены экспертам.</p>
             <button class="btn btn-primary" onclick="startScreen()">🔄 Новая приёмка</button>
         `);
-        // Имитация отправки в 1С
-        console.log('Отправка в 1С: поступление, приходный ордер, размещение.');
     }
 
-    // Универсальная функция захвата фото
+    // ---- Универсальная функция захвата фото ----
     function showCameraUpload(promptText, callback, multiple = false) {
         const input = document.createElement('input');
         input.type = 'file';
         input.accept = 'image/*';
-        input.capture = 'environment'; // на мобильных основная камера
+        input.capture = 'environment';
         if (multiple) input.multiple = true;
         input.onchange = (e) => {
             if (e.target.files.length > 0) {
                 callback(Array.from(e.target.files));
             }
         };
-        // Показываем подсказку
         const msg = document.createElement('div');
         msg.style.cssText = 'position:fixed;top:0;left:0;width:100%;background:rgba(0,0,0,0.8);color:white;padding:2rem;text-align:center;z-index:9999;font-size:1.2rem;';
         msg.textContent = promptText + ' (нажмите для выбора файла/камеры)';
@@ -455,7 +587,6 @@
         input.addEventListener('change', () => {
             document.body.removeChild(msg);
         });
-        // Если пользователь отменил
         input.addEventListener('cancel', () => {
             document.body.removeChild(msg);
         });
