@@ -134,17 +134,29 @@
         .green-dot { color: var(--success); font-weight: bold; }
         .red-dot { color: var(--danger); font-weight: bold; }
         .photo-thumb { display: inline-block; width: 80px; height: 80px; object-fit: cover; border-radius: 0.5rem; margin: 0.3rem; border: 1px solid #ddd; }
-        .sticky-top {
-            position: sticky;
-            top: 0;
-            background: white;
-            z-index: 10;
-            padding-bottom: 0.5rem;
+        /* Кнопка сканирования этикеток – зафиксирована в левом верхнем углу */
+        .sticky-btn {
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            z-index: 999;
+            background: var(--primary);
+            color: white;
+            padding: 0.7rem 1.2rem;
+            border-radius: 2rem;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
         }
         @media (max-width: 480px) {
             body { padding: 0; }
             .app-container { border-radius: 0; min-height: 100vh; }
             .btn { padding: 1rem; font-size: 1.1rem; }
+            .sticky-btn { top: 5px; left: 5px; padding: 0.6rem 1rem; }
         }
     </style>
 </head>
@@ -165,10 +177,10 @@
         packagingPhotos: [],
         unloadStart: null,
         unloadEnd: null,
-        docImages: [],
+        docImages: [],          // сырые файлы страниц документа
         parsedDoc: null,        // { supplier, docNumber, docDate, items: [{id, name, article, qty, unit}] }
-        scannedItems: [],      // id подтверждённых позиций
-        qualityResults: {},    // id -> {defect: bool, photos: []}
+        scannedItems: [],
+        qualityResults: {},
         placementMap: {},
     };
 
@@ -286,7 +298,40 @@
         });
     }
 
-    // ---- OCR + парсинг ----
+    // ---- Предобработка изображения перед OCR ----
+    function preprocessImage(file) {
+        return new Promise((resolve, reject) => {
+            const img = new Image();
+            img.onload = () => {
+                const canvas = document.createElement('canvas');
+                const ctx = canvas.getContext('2d');
+                canvas.width = img.width;
+                canvas.height = img.height;
+                ctx.drawImage(img, 0, 0);
+                // Повышаем контраст и переводим в ч/б
+                const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                const data = imageData.data;
+                for (let i = 0; i < data.length; i += 4) {
+                    const r = data[i];
+                    const g = data[i+1];
+                    const b = data[i+2];
+                    const gray = 0.299 * r + 0.587 * g + 0.114 * b;
+                    // Пороговая бинаризация
+                    const threshold = 128;
+                    const val = gray > threshold ? 255 : 0;
+                    data[i] = data[i+1] = data[i+2] = val;
+                }
+                ctx.putImageData(imageData, 0, 0);
+                canvas.toBlob((blob) => {
+                    resolve(blob);
+                }, 'image/png');
+            };
+            img.onerror = reject;
+            img.src = URL.createObjectURL(file);
+        });
+    }
+
+    // ---- OCR + парсинг с жёсткой фильтрацией ----
     async function performOCR() {
         if (state.docImages.length === 0) {
             alert('Сделайте хотя бы одно фото.');
@@ -295,13 +340,15 @@
         const statusDiv = document.getElementById('ocrStatus');
         const btn = document.getElementById('ocrBtn');
         btn.disabled = true;
-        statusDiv.textContent = '⏳ Распознавание...';
+        statusDiv.textContent = '⏳ Предобработка и распознавание...';
 
         let fullText = '';
         for (let i = 0; i < state.docImages.length; i++) {
             const file = state.docImages[i];
-            const imageUrl = URL.createObjectURL(file);
             try {
+                // Предобработка: улучшаем изображение
+                const processedBlob = await preprocessImage(file);
+                const imageUrl = URL.createObjectURL(processedBlob);
                 const { data: { text } } = await Tesseract.recognize(imageUrl, 'rus+eng', {
                     logger: m => {
                         if (m.status === 'recognizing text') {
@@ -311,154 +358,137 @@
                 });
                 fullText += text + '\n';
             } catch (e) {
+                console.error(e);
                 alert('Ошибка распознавания. Попробуйте ещё раз.');
                 btn.disabled = false;
                 return;
             }
         }
 
-        statusDiv.textContent = '✅ Текст распознан. Извлекаем данные...';
-        // Постобработка: исправление типичных ошибок OCR
-        fullText = applyOCRFixes(fullText);
+        statusDiv.textContent = '✅ Текст распознан. Анализируем...';
         const parsed = parseDocumentText(fullText);
         if (parsed && parsed.items.length > 0) {
             state.parsedDoc = parsed;
             stepVerifyLabels();
         } else {
-            alert('Не удалось найти товарные позиции. Убедитесь в хорошем качестве фото (свет, фокус) и повторите.');
+            alert('Не удалось найти товарные позиции. Убедитесь в хорошем качестве фото и чётком шрифте. Попробуйте переснять документ при ярком свете.');
             btn.disabled = false;
         }
     }
 
-    // Замена частых ошибок OCR на основе словаря и эвристик
-    function applyOCRFixes(text) {
-        let fixed = text;
-        // Типичные замены (пара буква -> правильная)
-        const replacements = {
-            'Лверь': 'Дверь',
-            'лверь': 'дверь',
-            'Стекло': 'Стекло', // бывает путаница с латинской C
-            'с?текло': 'стекло',
-            '5': '5', // цифра 5 может быть распознана как S, но исправлять сложно, оставим
-            '0': '0',
-        };
-        // Применим только для слов, которые есть в нашем мини-словаре
-        const knownWords = ['дверь', 'бампер', 'фара', 'зеркало', 'стекло', 'капот', 'крыло', 'радиатор', 'решётка'];
-        // Простая замена: ищем слова, похожие на известные с одной ошибкой
-        const words = fixed.split(/(\s+)/);
-        for (let i = 0; i < words.length; i++) {
-            const w = words[i].toLowerCase();
-            if (knownWords.includes(w)) continue;
-            // Попытка найти близкое известное слово (расстояние Левенштейна 1)
-            for (let kw of knownWords) {
-                if (levenshteinDistance(w, kw) <= 1) {
-                    words[i] = words[i].replace(w, kw); // сохраняем регистр? пусть будет оригинальный
-                    break;
-                }
-            }
-        }
-        fixed = words.join('');
-        return fixed;
-    }
-
-    function levenshteinDistance(a, b) {
-        const m = a.length, n = b.length;
-        const dp = Array.from({ length: m+1 }, () => Array(n+1).fill(0));
-        for (let i = 0; i <= m; i++) dp[i][0] = i;
-        for (let j = 0; j <= n; j++) dp[0][j] = j;
-        for (let i = 1; i <= m; i++) {
-            for (let j = 1; j <= n; j++) {
-                dp[i][j] = Math.min(
-                    dp[i-1][j] + 1,
-                    dp[i][j-1] + 1,
-                    dp[i-1][j-1] + (a[i-1] === b[j-1] ? 0 : 1)
-                );
-            }
-        }
-        return dp[m][n];
-    }
-
     function parseDocumentText(text) {
         const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-        // Шапка: ищем поставщика, номер, дату
-        const supplierPatterns = [/Поставщик:?\s*(.+)/i, /ООО\s*".+?"/, /ИП\s+.+/];
-        const docNumberPatterns = [/(?:Счёт|УПД|№)\s*[№#]?\s*([\d\-]+)/i, /(?:Счет|Счёт-фактура)\s*[№#]?\s*([\d\-]+)/i];
-        const datePattern = /от\s*(\d{2}\.\d{2}\.\d{4}|\d{4}-\d{2}-\d{2})/;
+        // Извлечение шапки
+        const supplier = extractField(lines, [/Поставщик:?\s*(.+)/i, /ООО\s*".+?"/, /ИП\s+.+/]);
+        const docNumber = extractField(lines, [/(?:Счёт|УПД|Счет-фактура|Счет)\s*[№#]?\s*([\d\-]+)/i, /№\s*([\d\-]+)/]);
+        const docDate = extractField(lines, [/от\s*(\d{2}\.\d{2}\.\d{4}|\d{4}-\d{2}-\d{2})/]);
 
-        let supplier = '', docNumber = '', docDate = '';
-        for (let line of lines) {
-            for (let p of supplierPatterns) {
-                let m = line.match(p);
-                if (m) { supplier = m[1] || m[0]; break; }
-            }
-            for (let p of docNumberPatterns) {
-                let m = line.match(p);
-                if (m) { docNumber = m[1]; break; }
-            }
-            let dm = line.match(datePattern);
-            if (dm) docDate = dm[1];
-        }
-        if (!supplier) supplier = 'Неизвестный поставщик';
-        if (!docNumber) docNumber = 'б/н';
-        if (!docDate) docDate = new Date().toLocaleDateString();
+        // Стоп-слова для исключения не-товарных строк
+        const stopWords = ['поставщик', 'покупатель', 'плательщик', 'грузополучатель', 'адрес', 'телефон', 'инн', 'кпп', 'р/с', 'банк', 'директор', 'менеджер', 'основание', 'всего', 'сумма', 'итого', 'ндс', 'подпись', 'расшифровка'];
+        // Дополнительные стоп-паттерны: длинные цифровые последовательности (>8 цифр) скорее всего телефон или счёт
+        const longNumberPattern = /\b\d{9,}\b/;
 
-        // Табличная часть: ищем строки, содержащие артикул (минимум 5 символов, буквы/цифры/дефис) и количество (число + единица)
         const items = [];
         const articleRegex = /([A-Za-z0-9\-]{5,})/;
         const qtyRegex = /(\d+)\s*(шт|ед|компл|л|кг|м)/i;
-        const skipKeywords = ['поставщик', 'покупатель', 'адрес', 'телефон', 'инн', 'кпп', 'р/с', 'банк', 'директор', 'менеджер'];
 
         for (let line of lines) {
-            // Пропускаем строки, содержащие явно не товарные данные
-            if (skipKeywords.some(kw => line.toLowerCase().includes(kw))) continue;
+            const lower = line.toLowerCase();
+            if (stopWords.some(kw => lower.includes(kw))) continue;
+            if (longNumberPattern.test(line)) continue; // пропускаем строки с длинными числами (телефоны, счета)
+
             const articleMatch = line.match(articleRegex);
             const qtyMatch = line.match(qtyRegex);
-            if (articleMatch) {
-                const article = articleMatch[1].toUpperCase();
-                // Если уже есть такой артикул, пропускаем (дубликат)
-                if (items.find(i => i.article === article)) continue;
-                // Количество
-                let qty = 1;
-                let unit = 'шт';
-                if (qtyMatch) {
-                    qty = parseInt(qtyMatch[1]) || 1;
-                    unit = qtyMatch[2] || 'шт';
-                }
-                // Название – всё, что до артикула, или после него, но не число
-                const parts = line.split(articleMatch[1]);
-                let name = parts[0].trim();
-                if (!name) name = parts[1] ? parts[1].trim() : 'Товар';
-                // Убираем возможные единицы измерения и числа из названия
-                name = name.replace(/\d+\s*(шт|ед|компл).*/i, '').trim();
-                if (!name) name = 'Товар';
-                items.push({
-                    id: items.length + 1,
-                    name: name,
-                    article: article,
-                    qty: qty,
-                    unit: unit
-                });
+            if (!articleMatch) continue; // без артикула — не товар
+
+            const article = articleMatch[1].toUpperCase();
+            // Исключаем артикулы, похожие на даты (содержат только цифры и точки)
+            if (/^\d{1,2}\.\d{1,2}\.\d{2,4}$/.test(article)) continue;
+            // Исключаем артикулы длиннее 25 символов (скорее всего не артикул)
+            if (article.length > 25) continue;
+
+            // Если уже есть такой артикул, дубликат
+            if (items.find(i => i.article === article)) continue;
+
+            let qty = 1;
+            let unit = 'шт';
+            if (qtyMatch) {
+                qty = parseInt(qtyMatch[1]) || 1;
+                unit = qtyMatch[2] || 'шт';
             }
+
+            // Название товара: всё, что до артикула, или после (но не числа)
+            const parts = line.split(articleMatch[1]);
+            let name = parts[0].trim();
+            if (!name) name = parts[1] ? parts[1].trim() : 'Товар';
+            // Удаляем единицы измерения и числа из названия
+            name = name.replace(/\d+\s*(шт|ед|компл).*/i, '').replace(/\d+/g, '').trim();
+            if (!name) name = 'Товар';
+            // Корректировка типичных ошибок OCR в названии
+            name = applyOCRFixes(name);
+
+            items.push({
+                id: items.length + 1,
+                name: name,
+                article: article,
+                qty: qty,
+                unit: unit
+            });
         }
 
-        return { supplier, docNumber, docDate, items };
+        return {
+            supplier: supplier || 'Неизвестный поставщик',
+            docNumber: docNumber || 'б/н',
+            docDate: docDate || new Date().toLocaleDateString(),
+            items: items
+        };
     }
 
-    // ---- Сверка этикеток (кнопка вверху) ----
+    function extractField(lines, patterns) {
+        for (let line of lines) {
+            for (let p of patterns) {
+                const m = line.match(p);
+                if (m) return m[1] || m[0];
+            }
+        }
+        return null;
+    }
+
+    // Исправление частых ошибок OCR в названиях
+    function applyOCRFixes(name) {
+        const fixes = {
+            'Лверь': 'Дверь',
+            'лверь': 'дверь',
+            'Стёкло': 'Стекло',
+            'с?текло': 'стекло',
+            '5': '5', // не меняем
+            '1': '1',
+            '7': '7',
+        };
+        let result = name;
+        // Простая замена известных искажений
+        for (let [wrong, right] of Object.entries(fixes)) {
+            result = result.replace(new RegExp(wrong, 'gi'), right);
+        }
+        return result;
+    }
+
+    // ---- Сверка этикеток (кнопка зафиксирована в левом верхнем углу) ----
     function stepVerifyLabels() {
         state.step = 'verify_labels';
         state.scannedItems = [];
         const doc = state.parsedDoc;
         if (!doc) return startScreen();
 
+        // Удаляем старую кнопку, если была
+        const oldBtn = document.getElementById('floatingScanBtn');
+        if (oldBtn) oldBtn.remove();
+
         render(`
             <div class="step-indicator"><span>4/7</span> Сверка этикеток</div>
-            <div class="sticky-top">
-                <div class="instruction">Сканируйте этикетки товаров</div>
-                <button class="btn btn-primary" id="scanLabelBtn" onclick="scanLabel()">📸 Сканировать этикетку</button>
-                <p style="text-align:center; margin:0.5rem 0;">Ожидается: ${doc.items.length} | Подтверждено: <span id="scannedCount">0</span></p>
-            </div>
-            <div id="labelList">
+            <div class="instruction">Сканируйте этикетки товаров</div>
+            <p style="text-align:center;">Ожидается: ${doc.items.length} | Подтверждено: <span id="scannedCount">0</span></p>
+            <div id="labelList" style="margin-bottom: 100px;">
                 ${doc.items.map(item => `
                     <div id="item-${item.id}" class="list-item" style="border-left: 4px solid #dc3545;">
                         <div><strong>${item.name}</strong><br><small>Арт: ${item.article} | ${item.qty} ${item.unit}</small></div>
@@ -468,16 +498,28 @@
             </div>
             <button class="btn btn-secondary" onclick="finishLabelCheck()">✅ Все этикетки отсканированы</button>
         `);
+
+        // Создаём плавающую кнопку
+        const floatingBtn = document.createElement('button');
+        floatingBtn.id = 'floatingScanBtn';
+        floatingBtn.className = 'sticky-btn';
+        floatingBtn.innerHTML = '📸 Сканировать этикетку';
+        floatingBtn.onclick = scanLabel;
+        document.body.appendChild(floatingBtn);
     }
 
     async function scanLabel() {
+        const btn = document.getElementById('floatingScanBtn');
+        if (!btn) return;
+        btn.disabled = true;
+        btn.textContent = '🔎 Жду фото...';
+
         showCameraUpload('Сфотографируйте этикетку', async (files) => {
-            const file = files[0];
-            const imageUrl = URL.createObjectURL(file);
-            const btn = document.getElementById('scanLabelBtn');
-            btn.disabled = true;
             btn.textContent = '🔎 Распознаю...';
+            const file = files[0];
             try {
+                const processedBlob = await preprocessImage(file);
+                const imageUrl = URL.createObjectURL(processedBlob);
                 const { data: { text } } = await Tesseract.recognize(imageUrl, 'rus+eng', {
                     logger: m => {
                         if (m.status === 'recognizing text') {
@@ -485,7 +527,6 @@
                         }
                     }
                 });
-                // Ищем артикул в этикетке
                 const articleMatch = text.match(/([A-Za-z0-9\-]{5,})/);
                 if (articleMatch) {
                     const scannedArticle = articleMatch[1].toUpperCase();
@@ -522,11 +563,14 @@
             const userChoice = confirm(`⚠️ Недостача:\n${list}\n\n"OK" — подтвердить и продолжить, "Отмена" — вернуться к сканированию.`);
             if (!userChoice) return;
         }
+        // Убираем плавающую кнопку
+        const btn = document.getElementById('floatingScanBtn');
+        if (btn) btn.remove();
         alert('📤 Отправка в 1С: поступление и приходный ордер сформированы.');
         stepQualityControl();
     }
 
-    // Остальные шаги (входной контроль, размещение) без изменений
+    // Остальные шаги без изменений
     function stepQualityControl() {
         state.step = 'quality_control';
         const allItems = state.parsedDoc.items;
