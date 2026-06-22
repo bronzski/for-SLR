@@ -369,35 +369,47 @@
     }
 
     function parseDocumentText(text) {
-        // Базовые данные документа
         const linesRaw = text.split('\n').map(l => l.trim()).filter(l => l.length > 3);
-        const supplier = extractField(linesRaw, [/Поставщик:?\s*(.+)/i, /ООО\s*["«](.+?)["»]/, /ИП\s+([А-Яа-яA-Za-z\s]+)/]);
+        
+        // Пытаемся извлечь шапку
+        const supplier = extractField(linesRaw, [/Поставщик:?\s*(.+)/i, /ООО\s*["«](.+?)["»]/, /ИП\s+([А-Яа-яA-Za-z\s]+)/, /СЧЕТ\s*([А-Яа-яA-Za-z\-]+)/i]);
         const docNumber = extractField(linesRaw, [/(?:Счёт|УПД|Счет-фактура|Счет)\s*[№#]?\s*([\d\-A-Za-z]+)/i, /№\s*([\d\-]+)/]);
-        const docDate = extractField(linesRaw, [/от\s*(\d{2}\.\d{2}\.\d{4}|\d{4}-\d{2}-\d{2})/]);
+        const docDate = extractField(linesRaw, [/от\s*(\d{2}\.\d{2}\.\d{4}|\d{4}-\d{2}-\d{2}|\d{1,2}\s+[а-яА-Я]+\s+\d{4})/]);
 
-        // Стоп-слова для полного игнора строк
-        const stopWords = ['поставщик', 'покупатель', 'плательщик', 'грузополучатель', 'адрес', 'телефон', 'инн', 'кпп', 'р/с', 'банк', 'директор', 'менеджер', 'основание', 'итого', 'в т.ч. ндс', 'подпись', 'расшифровка', 'сумма', 'цена', 'страница'];
-        
         const items = [];
-        
-        // Регулярка для количества (например: 5 шт, 10 компл, 2 кг)
         const qtyRegex = /\b(\d+)\s*(шт|ед|компл|л|кг|м|упак)\b/i;
         
-        // Регулярка для артикула: от 4 до 20 символов (буквы + цифры + дефисы).
-        // Добавлена кириллица. Исключает чисто символьные последовательности без букв/цифр.
-        const articlePattern = /\b([A-ZА-Яa-zа-я0-9\-]{4,20})\b/g;
+        // НОВОЕ ПРАВИЛО АРТИКУЛА: От 4 до 20 символов, НО ОБЯЗАТЕЛЬНО содержит хотя бы одну цифру!
+        // Это отсекает мусор вроде "MAIL", "LOGAN", "BER", "HERE".
+        const articlePattern = /\b(?=[A-ZА-Яa-zа-я\-]*\d)[A-ZА-Яa-zа-я0-9\-]{4,20}\b/g;
+
+        let inTable = false;
 
         for (let line of linesRaw) {
             let lower = line.toLowerCase();
             
-            // 1. Проверка на стоп-слова
-            if (stopWords.some(kw => lower.includes(kw))) continue;
+            // 1. Пытаемся понять, где началась и закончилась таблица
+            if (lower.includes('наименование') || lower.includes('товар') || lower.includes('артикул') || lower.includes('код')) {
+                inTable = true;
+                continue; 
+            }
+            if (lower.includes('итого') || lower.includes('всего к оплате') || lower.includes('сумма') || lower.includes('в т.ч. ндс')) {
+                inTable = false;
+                continue; // Всё, что ниже "Итого" нам не нужно
+            }
 
-            // 2. Предварительная очистка от финансовых сумм (чтобы они не попали в артикулы)
-            // Удаляем паттерны типа "1 500,00", "150.00", "25 000"
+            // 2. ЖЕСТКИЙ ФИЛЬТР МУСОРА (адреса, почты, контакты, реквизиты)
+            // Если строка содержит хоть один из этих элементов — выкидываем её целиком
+            if (/@/.test(line) || lower.includes('email') || lower.includes('e-mail') || lower.includes('сайт')) continue;
+            if (lower.includes('заказчик') || lower.includes('получатель') || lower.includes('плательщик') || lower.includes('поставщик') || lower.includes('грузоотправитель')) continue;
+            if (lower.includes('ул.') || lower.includes('г.') || lower.includes('д.') || lower.includes('стр.') || lower.includes('обл.')) continue;
+            if (lower.includes('тел.') || lower.includes('телефон') || lower.includes('+7') || /\b8\s*\(/.test(line)) continue;
+            if (lower.includes('инн') || lower.includes('кпп') || lower.includes('бик') || lower.includes('р/с') || lower.includes('к/с') || lower.includes('счет') || lower.includes('упд')) continue;
+
+            // 3. Предварительная очистка от цен и сумм, чтобы они не попали в артикулы (например 1 500.00)
             let cleanLine = line.replace(/\b\d+[\s\.,]+\d{2}\b/g, ' ');
             
-            // 3. Поиск количества
+            // 4. Поиск количества
             const qtyMatch = cleanLine.match(qtyRegex);
             let qty = 1;
             let unit = 'шт';
@@ -406,40 +418,35 @@
                 unit = qtyMatch[2] || 'шт';
             }
 
-            // 4. Поиск артикула
+            // 5. Поиск артикула с учетом обязательной цифры
             let matches = [...cleanLine.matchAll(articlePattern)];
             let article = null;
             
             for (let match of matches) {
-                let candidate = match[1];
+                let candidate = match[0];
                 
-                // Фильтрация ложных артикулов:
-                // Отсеиваем даты
+                // Дополнительно отсеиваем даты
                 if (/^\d{2}\.\d{2}\.\d{2,4}$/.test(candidate)) continue;
-                // Отсеиваем ИНН/КПП/Телефоны (чистые цифры длиной 9, 10, 11, 12)
-                if (/^\d+$/.test(candidate) && [9, 10, 11, 12].includes(candidate.length)) continue;
-                // Отсеиваем мелкие цифры (до 3 знаков), если это не явно указанный артикул
+                // Отсеиваем номера (чистые цифры длиной 9-12 символов, типично для счетов/ИНН если они проскочили)
+                if (/^\d+$/.test(candidate) && candidate.length > 8) continue;
+                // Отсеиваем мелкие цифры до 3 знаков, если это не явно указанный артикул (например порядковый номер в таблице)
                 if (/^\d{1,3}$/.test(candidate) && !lower.includes('арт')) continue;
 
                 article = candidate.toUpperCase();
-                break; // Берем первый подходящий
+                break; 
             }
 
-            if (!article) continue; // Без артикула строку игнорируем
-            if (items.find(i => i.article === article)) continue; // Исключаем дубликаты
+            if (!article) continue; 
+            if (items.find(i => i.article === article)) continue; 
 
-            // 5. Формирование чистого наименования
-            // Удаляем из строки найденный артикул и всё, что связано с количеством
+            // 6. Вытягиваем наименование, удаляя артикул и количество
             let name = cleanLine
                 .replace(article, '')
                 .replace(qtyRegex, '')
-                .replace(/№/g, '') // убираем значки номера
+                .replace(/^[№\|]+/g, '') // Убираем палки и номера в начале
                 .trim();
                 
-            // Убираем лишние спецсимволы по краям
             name = name.replace(/^[-.,:;]+|[-.,:;]+$/g, '').trim();
-            
-            // Применяем исправления типичных опечаток OCR
             name = applyOCRFixes(name);
             
             if (!name || name.length < 3) name = 'Товар (наименование не распознано)';
@@ -537,7 +544,6 @@
                 const imageUrl = URL.createObjectURL(processedBlob);
                 const { data: { text } } = await Tesseract.recognize(imageUrl, 'rus+eng');
                 
-                // Ищем артикул на этикетке
                 const articleMatch = text.match(/\b([A-ZА-Яa-zа-я0-9\-]{4,20})\b/);
                 
                 if (articleMatch) {
@@ -555,7 +561,7 @@
                         }
                         alert(`✓ Подтверждено: "${foundItem.name}"`);
                     } else {
-                        alert(`⚠️ Артикул "${scannedArticle}" не числится в распознанном документе! Возможно, это пересорт или ошибка OCR.`);
+                        alert(`⚠️ Артикул "${scannedArticle}" не числится в распознанном документе!`);
                     }
                 } else {
                     alert('Не удалось распознать артикул на этикетке. Попробуйте ближе и четче.');
